@@ -1,0 +1,470 @@
+---
+title: "Ceda Code for example 1"
+author: "Sabrina Enriquez"
+date: "10/23/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Code for  "Categorical exploratory data analysis on goodness-of-fit issues by Sabrina Enriquez, Fushing Hsieh"
+
+Here we will show the entire CEDA algorithm 1 and 2 from the paper applied to the fly data found at https://seattlecentral.edu/qelp/sets/057/057.html. First we load some useful libraries: 
+
+```{r, message=FALSE}
+library(data.table)
+library(dplyr)
+library(ggpubr)
+library(dendextend)
+library(gplots)
+library(ggplot2)
+library(NbClust)
+library(RColorBrewer)
+library(nortest)
+
+```
+
+
+
+
+## Functions
+
+Here we will list functions used throughout the algorithms.
+
+
+bin_intervals determines bin intervals from our original data.
+
+input: original data and number of clusters K
+
+output: array with K bin intervals
+
+```{r}
+bin_intervals <- function(dataset, clustersK) {
+  dd <- dist((dataset), method = "euclidean")
+  HC <- hclust(dd, method = "ward.D2")
+  #divide data in HC into K clusters
+  cut_HC <- cutree(HC, k = clustersK)
+  cut_HC_df <- data.frame(cut_HC)
+  #create a 2 column matrix: dataset_bin_count showing members and clusters
+  dataset_bin_count <- mutate(dataset, cluster = cut_HC)
+  # #observed boxes tells us index of arranged data
+  # observedboxes<- rect.hclust(HC , k = clustersK, border = 2:6)
+  #intervalRange store range values of each interval
+  intervalRange <-
+    data.frame(
+      "clusterMin" = matrix(0, clustersK, 1),
+      "clusterMax" = matrix(0, clustersK, 1),
+      "cluster" = c(1:clustersK)
+    )
+  #determine min of data
+  minimum <- min(dataset)
+  intervalRange[1, 1] <- minimum
+  
+  binsByIndex <- data.frame(matrix(0, nrow(dataset), clustersK))
+  counter <- matrix(1, 1, clustersK)
+  for (j in 1:nrow(dataset)) {
+    for (i in 1:clustersK) {
+      if (cut_HC_df[j, 1] == i) {
+        binsByIndex[counter[1, i], i] <- j
+        counter[1, i] <- counter[1, i] + 1
+        break
+      }
+    }
+  }
+  
+  #matrix of values
+  BinsValues <- binsByIndex
+  for (j in 1:ncol(binsByIndex)) {
+    for (i in 1:nrow(binsByIndex)) {
+      if (binsByIndex[i, j] != 0) {
+        BinsValues[i, j] <- dataset[binsByIndex[i, j], 1]
+        
+      }
+    }
+  }
+  
+  for (i in 1:nrow(intervalRange)) {
+    intervalRange[i, 1] <- min(BinsValues[BinsValues[, i] > 0, i]) #min
+    intervalRange[i, 2] <- max(BinsValues[, i]) #max
+  }
+  
+  intervalRange <- intervalRange[order(intervalRange[, 1]), ]
+  row.names(intervalRange) <- NULL
+  
+  return(intervalRange)
+}
+
+```
+
+bincount function gives us a matrix showing how many datum fall into each bin defined by bin_intervals.
+
+input: dataframe that consists of one column bin interval matrix dim: clusterK x 2
+
+output: matrix showing how many objects are in each bin.
+
+```{r}
+bincount <- function(dataset, intervals) {
+  #add a column of zeros for cluster column
+  dataset_bins <-
+    data.frame(dataset, "cluster" = matrix(0, nrow(dataset), 1))
+  
+  #according to our bin intervals determine which bin each data is in and store in cluster col of
+  #dataset_bins
+
+  for (i in 1:nrow(dataset)) {
+    for (j in 1:nrow(intervals))
+    {
+      if (dataset[i, 1] <= intervals[1, 2])
+      {
+        dataset_bins[i, 2] <- 1
+      }
+      if (dataset[i, 1] >= intervals[j, 1] &
+          dataset[i, 1] <= intervals[j, 2])
+      {
+        dataset_bins[i, 2] <- j
+      }
+      if (dataset[i, 1] >= intervals[nrow(intervals), 1])
+      {
+        dataset_bins[i, 2] <- nrow(intervals)
+      }
+    }
+  }
+  
+  #create vector totals that counts how many members in each bin
+  
+  totals_in_bins <-
+    setNames(data.frame(matrix(0, nrow(intervals), 1)), names(dataset))
+  for (i in 1:nrow(dataset))
+  {
+    totals_in_bins[dataset_bins[i, 2], 1] <-
+      totals_in_bins[dataset_bins[i, 2], 1] + 1
+  }
+  
+  
+  return(totals_in_bins)
+  
+}
+```
+
+diffMatrixGivenSims gives us a difference matrix of pre-simulated data.
+
+Input: bincount matrix and bin intervals.
+
+Output: difference matrix for data.
+
+```{r}
+diffMatrixGivenSims<- function(bincount_matrix, intervals)
+{
+  
+  observedbincounts<-data.matrix(bincount_matrix[2])
+  
+  
+  diff_matrix<-data.matrix(bincount_matrix)
+  
+  for(j in 1:nrow(intervals)){
+    
+    for (i in 2:(ncol(bincount_matrix))){
+      diff_matrix[[j,i]]=diff_matrix[[j,i]]-observedbincounts[[j,1]]
+    } 
+  } 
+  
+  for(i in 1: nrow(diff_matrix)) #replace values by {0,1,-1}
+  {
+    for(j in 1: ncol(diff_matrix))
+    {
+      if(diff_matrix[i,j]<0) #neg values -> -1
+      {
+        diff_matrix[i,j]<- -1
+      }
+      if(diff_matrix[i,j]>0) #pos values -> 1
+      {
+        diff_matrix[i,j]<- 1
+      }
+    }
+  }
+  
+  return(diff_matrix)
+}
+```
+
+
+diffMatrix will first simulate data from the observed and then give us the difference matrix.
+
+input: number of simulations, observed dataframe, intervals
+
+output: bincount differences between simulations and observed data bin by bin
+```{r}
+diffMatrix <- function(simNum, df, intervals)
+{
+  dataAndSims = data.frame(df)
+  for (i in 1:simNum) {
+    simulation <-
+      data.frame("sim" = round(rnorm(
+        nrow(df), mean = mean(df[[1]]), sd = sd(df[[1]])
+      )))
+    simulation <- arrange(simulation, simulation)
+    dataAndSims <- cbind(dataAndSims, simulation)
+    
+  }
+  
+  
+  bincount_matrix <- data.frame("cluster" = c(1:nrow(intervals)))
+  
+  for (i in 1:(simNum + 1)) {
+    bincount_matrix <-
+      cbind(bincount_matrix, bincount(dataAndSims[i], intervals))
+  }
+  
+  observedbincounts <- data.matrix(bincount_matrix[2])
+  
+  
+  diff_matrix <- data.matrix(bincount_matrix)
+  
+  for (j in 1:nrow(intervals)) {
+    for (i in 2:(simNum + 2)) {
+      diff_matrix[[j, i]] = diff_matrix[[j, i]] - observedbincounts[[j, 1]]
+    }
+  }
+  
+  return(diff_matrix)
+}
+```
+
+
+Here we find the P-odds of individual leaves. We will use these in other functions.
+```{r}
+allPaths <- function(dend)
+{
+  subtrees <- partition_leaves(dend)
+  leaves <- subtrees[[1]]
+  
+  pathRoutes <- function(leaf) {
+    which(sapply(subtrees, function(x)
+      leaf %in% x))
+  }
+  
+  paths <- lapply(leaves, pathRoutes)
+  
+  return(paths)
+}
+
+# get the path of leaf: nodes in order when you go from top to bottom
+
+podds <- function(vec) {
+  odd <- 1
+  for (i in 2:length(vec)) {
+    odd <- odd * (vec[i] / (vec[i - 1] - vec[i]))
+  }
+  
+  return(odd)
+  
+}
+
+## compute the p-odds based on the leaf's nodes number across the path
+
+get_podds_leaf <- function(paths, dend) {
+  nodes.num <- lapply(1:length(paths), function(which.leaf) {
+    return(get_nodes_attr(dend, "members", id = paths[[which.leaf]]))
+    
+  })## get the nodes number across the paths for each leaf
+  
+  
+  podds_leaf <- sapply(1:length(paths), function(which.leaf) {
+    return(podds(nodes.num[[which.leaf]]))
+  }) ## the p-odds for each leaf
+  
+  return(podds_leaf)#list(nodes.num,podds_leaf)
+  
+}
+```
+
+pvalAndPoddsLeaf gives us the p-value and p-odds of our observed data- one of the leaves of the HC.
+
+input: HC: hierarchical cluster object. observedVecLength: integer corresponding to the number of leaves (aka observations) you want the p-value and p-odds of. They must be the first observations in the matrix used to compute HC.
+
+output: the p-value and P-odds of the leaves corresponding to the first observedVecLength observations in the matrix that created HC.
+
+```{r}
+pvalAndPoddsLeaf<- function(HC, observedVecLength)
+{
+  dend.obj <- as.dendrogram(HC)
+  paths <- allPaths(dend.obj)
+  leaves <- labels(HC)
+  leaves.podds <- get_podds_leaf(paths, dend.obj)
+  ## podds correspond to the leaves in plot
+  ## in order from left to right ( not the order for original data!!!!)
+  ## the more extreme a leaf is, the p-odds smaller, the most extreme value is 1/(N-1)
+  
+  
+  mat <- cbind(leaves, leaves.podds)
+  colnames(mat) <- c('leaves', 'PO')
+  label.podds <- mat[order(mat[, 1], decreasing = F), ]
+  
+  MST.set.PO <- list(bylabels = label.podds, byleaves = mat)
+  ## list[[1]] show the POdds corresponding to the order as the original data
+  ## list[[2]] shows the POdds corresponding to the order in the dend plot accordingly
+  
+  
+  PO_mst_obs <- data.frame(MST.set.PO$bylabels[1, 2])
+  if (observedVecLength > 1) {
+    for (i in 2:observedVecLength)
+    {
+      PO_mst_obs <- cbind(PO_mst_obs, MST.set.PO$bylabels[i, 2])
+    }
+  }
+  PO_mst_obs <- t(PO_mst_obs)
+  
+  
+  pval <-
+    data.frame(length(which(MST.set.PO$bylabels[-c(1:observedVecLength), 2] < PO_mst_obs[1])) /
+                 (dim(MST.set.PO$bylabels)[1] - observedVecLength))
+  if (observedVecLength > 1) {
+    for (i in 2:observedVecLength)
+    {
+      nextpval <-
+        data.frame(length(which(MST.set.PO$bylabels[-c(1:observedVecLength), 2] < PO_mst_obs[i])) /
+                     (dim(MST.set.PO$bylabels)[1] - observedVecLength))
+      pval <- cbind(pval, nextpval)
+    }
+  }
+  pval <- t(pval)
+  colnames(pval) = "pval"
+  row.names(pval) <- row.names(PO_mst_obs)
+  PO_mst_obs <- cbind(PO_mst_obs, pval)
+  
+  return(PO_mst_obs)
+}
+
+```
+
+## Implementation for fly data
+First let's look through the traditional tests for normality:
+
+```{r}
+flydatadf <- data.frame(fread('https://seattlecentral.edu/qelp/sets/057/s057.txt'))
+colnames(flydatadf)<- "flydata"
+
+#here is the density plot for the data and normal distribution given data's parameters
+flydataplot<-density(flydatadf$flydata)
+x <- seq(30, 60, length=100)
+y <- dnorm(x, mean= 45.5, sd=3.919647)
+plot(flydataplot, main = "Density plot of fly wing length",
+                       xlab = "Wing length")
+lines(x, y, type="l", lwd=2, col="red")
+legend(30, .08, legend=c("normal distribution", "flydata distribution"),
+       col=c("red", "black"), lty=1:2, cex=0.8)
+
+#qq plot for flydata
+ggqqplot(flydatadf$flydata, main="QQ-Plot for observed fly data fit to Normal Distribution")
+
+#superimpose normal distribution onto histogram with defined bins
+g = flydatadf$flydata
+h<-hist(g,breaks=c(36,40,42,44,46,48,50,52,55),  plot= FALSE )
+xhist<-c(min(h$breaks),h$breaks)
+yhist<-c(0,h$density,0)
+xfit<-seq(min(g),max(g),length=40)
+yfit<-dnorm(xfit,mean=mean(g),sd=sd(g))
+plot(xhist,yhist,type="s",ylim=c(0,max(yhist,yfit)), xlab = "wing length",xlim =c(36,55),main = "Normal Distribution superimposed on fly data histogram")
+lines(xfit,yfit, col="red")
+
+#shapiro-wilk test
+tradPval<-shapiro.test(flydatadf$flydata)
+print(tradPval)
+
+#chi-squared test: Moore classes number
+chi_fly<-pearson.test(as.matrix(flydatadf), n.classes = ceiling(2 * (100^(2/5))), adjust = TRUE)
+print(chi_fly)
+
+
+#K-S test
+
+KS_fly<-ks.test(as.matrix(flydatadf), "pnorm", mean=mean(as.matrix(flydatadf)), sd=sd(as.matrix(flydatadf)))
+print(KS_fly)
+
+
+```
+## Implementing CEDA algorithm 1: 
+
+```{r}
+
+#New method for normality
+# Compute distances and hierarchical clustering
+dd <- dist((flydatadf), method = "euclidean")
+HC <- hclust(dd, method = "ward.D2")
+plot(HC, main="HC for Fly data", xlab = "length (x.1mm)")
+
+cut_HC<- cutree(HC, k=8)
+plot(HC, main="HC for Fly data", xlab = "length (x.1mm)")
+observedboxes<- rect.hclust(HC , k = 8, border = 2:6)
+observedcutoff<-abline(h = 5, col = 'cyan')
+
+#implement functions
+
+intervals8<- bin_intervals(flydatadf, 8)
+bincounts8<- bincount(dataset = flydatadf, intervals8)
+
+#100 simulations
+
+set.seed(100)
+flyAnd100= data.frame(flydatadf)
+for (i in 1:100) {
+  simulation<-data.frame("sim" =round(rnorm(100, mean= 45.5, sd=3.919647)))
+  simulation<-arrange(simulation, simulation)
+  flyAnd100<-cbind(flyAnd100, simulation)
+
+}
+
+
+bincount_matrix<- data.frame("cluster"=c(1,2,3,4,5,6,7,8))
+for (i in 1:101) {
+  bincount_matrix<- cbind(bincount_matrix, bincount(flyAnd100[i], intervals8))
+}
+
+arrayBinCount= data.matrix(bincount_matrix[2:102])
+PO_matrix<- prop.table(arrayBinCount,2)
+tPO<-t(PO_matrix)
+
+
+#heatmaps for fly data and simulations
+
+theat_fly100d<- heatmap.2(tPO, trace="none",hclustfun = function(x) hclust(x,method = "ward.D2"), ylab = "fly data and 100 simulations",
+                          xlab = "bins", main= "Fly Data and 100 simulations using d*")
+```
+
+After producing the heatmap from algorithm 1 we can dress it up and highlight our observed vector:
+```{r}
+sepval=nrow(tPO)-which(labels(theat_fly100d$rowDendrogram)=="flydata")
+
+
+theat_fly100d<- heatmap.2(tPO, trace="none",hclustfun = function(x) hclust(x,method = "ward.D2"), ylab = "fly data and 100 simulations",
+                          xlab = "bins",cexRow = 0.2,cexCol = 0.5, srtCol=0, offsetCol = 0, offsetRow = -1,RowSideColors = c(rep("blue",1), rep("white",100)), rowsep = c(sepval,sepval+1),sepcolor = "blue", colRow = c(rep("blue",1), rep("black",100)),main= "Fly Data and 100 simulations using d*")
+
+
+#display the p-value and p-odds of our observed data
+pvaluefly100<-pvalAndPoddsLeaf(theat_fly100d$rowDendrogram, 1)
+print(pvaluefly100)
+
+
+```
+
+## Implementing Algorithm 2
+```{r}
+
+tprotoFly<-diffMatrixGivenSims(bincount_matrix,intervals8)
+tprotoFly<-tprotoFly[,-1]
+tprotoFly<-t(tprotoFly)
+
+
+heatmap_flyproto<- heatmap.2(tprotoFly, trace="none", hclustfun = function(x) hclust(x,method = "ward.D2"), xlab = "Wing length bins",
+                              ylab = "fly data and 100 simulations", main= "8 clusters of fly wing data")
+
+
+sepval=nrow(tprotoFly)-which(labels(heatmap_flyproto$rowDendrogram)=="flydata")
+
+
+heatmap_flyproto<- heatmap.2(tprotoFly, trace="none", hclustfun = function(x) hclust(x,method = "ward.D2"), xlab = "Wing length bins",
+                              ylab = "fly data and 100 simulations", main= "8 clusters of fly wing data", RowSideColors = c(rep("blue",1), rep("white",(nrow(tprotoFly)-1))),
+                              cexRow = 0.2,cexCol = 0.5, srtCol=0, offsetCol = 0, offsetRow = -1, rowsep = c(sepval,sepval+1), sepcolor = "blue", colRow = c(rep("blue",1), rep("black",100)))
+```
